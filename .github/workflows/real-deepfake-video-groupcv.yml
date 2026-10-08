@@ -1,0 +1,124 @@
+name: Real Paired Deepfake Video Group-Holdout Pilot
+on:
+  push:
+    branches:
+      - research/deepfake-video-pairs-20261008
+permissions:
+  contents: read
+jobs:
+  video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install video dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "huggingface_hub==0.30.2" "opencv-python-headless==4.11.0.86" "scikit-image==0.25.2" "scikit-learn==1.6.1" "numpy==2.2.5" "pandas==2.2.3" "scipy==1.15.2"
+      - name: Download genuine paired video and run group holdout
+        env:
+          HF_HUB_DISABLE_XET: '1'
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        shell: bash
+        run: |
+          mkdir -p results
+          cat >/tmp/video.py <<'PY'
+          import os,sys,json,hashlib
+          import cv2,numpy as np,pandas as pd
+          from pathlib import Path
+          from collections import defaultdict
+          from huggingface_hub import HfApi,hf_hub_download
+          from skimage.feature import hog
+          from sklearn.model_selection import GroupKFold
+          from sklearn.metrics import confusion_matrix,accuracy_score,roc_auc_score,precision_score,recall_score,f1_score
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.pipeline import Pipeline
+          from sklearn.preprocessing import StandardScaler
+          REPO='belkhir-nacim/deepfake-videos';OUT=Path('results')
+          api=HfApi()
+          try:
+              files=list(api.list_repo_tree(repo_id=REPO,repo_type='dataset',path_in_repo='videos/UADFV',recursive=True))
+              paths=[v.path for v in files if str(v.path).lower().endswith(('.mp4','.mov'))]
+              print('UADFV enumerated path count',len(paths),flush=True)
+          except Exception as exc:
+              print('UADFV access failed',str(exc)[:500],flush=True);paths=[]
+          bykey=defaultdict(dict)
+          for path in paths:
+              lc=path.lower()
+              cls= 'real' if '/real/' in lc else 'fake' if '/fake/' in lc else None
+              if cls:bykey[Path(path).stem][cls]=path
+          groups=sorted(k for k,v in bykey.items() if 'real' in v and 'fake' in v)[:24]
+          if len(groups)<8:
+              raise RuntimeError(f'UADFV has fewer than 8 verified real-fake source file pairs: {len(groups)}. No synthetic replacement allowed.')
+          print('UADFV paired sources',len(groups),flush=True)
+          def encode(path):
+              fn=hf_hub_download(repo_id=REPO,repo_type='dataset',filename=path)
+              rawsha=hashlib.sha256(Path(fn).read_bytes()).hexdigest()
+              cap=cv2.VideoCapture(fn)
+              n=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+              frames=[]
+              for idx in np.linspace(0,max(n-1,0),8,dtype=int):
+                  cap.set(cv2.CAP_PROP_POS_FRAMES,int(idx))
+                  ok,f=cap.read()
+                  if ok:
+                      im=cv2.resize(f,(64,64),interpolation=cv2.INTER_AREA)
+                      gray=cv2.cvtColor(im,cv2.COLOR_BGR2GRAY)
+                      ho=hog(gray.astype(np.float32)/255.,orientations=9,pixels_per_cell=(8,8),cells_per_block=(2,2),feature_vector=True).astype(np.float32)
+                      rgb=im.astype(np.float32)/255.
+                      frames.append((ho,rgb.mean((0,1)),gray.astype(np.float32)/255.))
+              cap.release()
+              if len(frames)<4:raise RuntimeError('Could not decode >=4 authentic frames from '+path)
+              H=np.stack([f[0] for f in frames]);c=np.stack([f[1] for f in frames]);g=np.stack([f[2] for f in frames])
+              temporal=np.abs(np.diff(g,axis=0)).mean()
+              feature=np.concatenate([H.mean(axis=0),H.std(axis=0),c.mean(axis=0),c.std(axis=0),[float(temporal)],np.array([float(len(frames))],dtype=np.float32)])
+              return feature.astype(np.float32),rawsha,len(frames),n
+          features=[];labels=[];manifest=[];pairs=[]
+          for k in groups:
+              pair={}
+              try:
+                  for cls in ['real','fake']:
+                      fn=bykey[k][cls]
+                      feat,sha,nframes,total=encode(fn)
+                      pair[cls]=(feat,sha,nframes,total,fn)
+              except Exception as exc:
+                  print('PAIR excluded - decoding or file failure',k,str(exc)[:300],flush=True);continue
+              for cls in ['real','fake']:
+                  feat,sha,nframes,total,fn=pair[cls]
+                  features.append(feat);labels.append(int(cls=='fake'));pairs.append(k)
+                  manifest.append({'group_pair_key':k,'path':fn,'label_fake':int(cls=='fake'),'sha256_video':sha,'frames_decoded':nframes,'total_frames_reported':total})
+              print('PAIRED',k,flush=True)
+          if len(set(pairs))<8:raise RuntimeError('Insufficient complete authentic pairs after decoding')
+          X=np.stack(features);y=np.array(labels);gg=np.array(pairs)
+          pd.DataFrame(manifest).to_csv(OUT/'manifest.csv',index=False)
+          if len(set(v['sha256_video'] for v in manifest))!=len(manifest):raise RuntimeError('Exact duplicate videos between pair groups')
+          folds=GroupKFold(n_splits=4)
+          rows=[]; preds=[]
+          for seed in [11,22,33,44,55]:
+              for fold,(tr,te) in enumerate(folds.split(X,y,gg),1):
+                  assert set(gg[tr]).isdisjoint(set(gg[te]))
+                  for name,clf in [('logistic',Pipeline([('scaler',StandardScaler()),('lr',LogisticRegression(max_iter=500,random_state=seed))])),('random_forest',RandomForestClassifier(n_estimators=100,min_samples_leaf=1,max_depth=12,n_jobs=2,random_state=seed))]:
+                      clf.fit(X[tr],y[tr])
+                      p=clf.predict_proba(X[te])[:,1];out=(p>=.5).astype(int)
+                      for j,idx in enumerate(te):
+                          preds.append(dict(seed=seed,fold=fold,model=name,pair=str(gg[idx]),label_fake=int(y[idx]),p_fake=float(p[j]),pred_fake=int(out[j])))
+                      tn,fp,fn,tp=map(int,confusion_matrix(y[te],out,labels=[0,1]).ravel())
+                      d=dict(seed=seed,fold=fold,model=name,test_pairs=len(set(gg[te])),n=len(te),accuracy=float(accuracy_score(y[te],out)),f1=float(f1_score(y[te],out,zero_division=0)),auroc=float(roc_auc_score(y[te],p)),precision=float(precision_score(y[te],out,zero_division=0)),recall=float(recall_score(y[te],out,zero_division=0)),tn=tn,fp=fp,fn=fn,tp=tp)
+                      rows.append(d);print('RESULT',json.dumps(d),flush=True)
+          pd.DataFrame(preds).to_csv(OUT/'video_group_cv_predictions.csv',index=False)
+          pd.DataFrame(rows).to_csv(OUT/'video_group_cv_fold_metrics.csv',index=False)
+          meta=dict(dataset=REPO,repo_revision=api.dataset_info(REPO).sha,used_source='UADFV',actual_real_fake_pairs=len(set(pairs)),actual_video_count=len(manifest),grouping='real/fake matching basename pair held together across folds; subject identity isolation NOT independently verified',source_label='fake positive',features='HOG + color and temporal summary of 8 decoded frames, NOT a trained deep video neural network',seeds=[11,22,33,44,55],folds=4,limitations='Small UADFV pilot; publication should NOT claim robust video generalization across identities or datasets')
+          (OUT/'protocol.json').write_text(json.dumps(meta,indent=2))
+          (OUT/'RUN_COMPLETED.json').write_text(json.dumps({'genuine_video_loaded':True,'videos':len(manifest),'verified_pairs':len(set(pairs)),'fold_metrics':len(rows),'predictions':len(preds)},indent=2))
+          print('VIDEO GROUP-HOLDOUT COMPLETE',flush=True);sys.stdout.flush();sys.stderr.flush();os._exit(0)
+          PY
+          python /tmp/video.py
+      - name: Upload the real video experiment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-uadfv-video-pilot
+          path: results/
+          if-no-files-found: warn
