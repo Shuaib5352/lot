@@ -1,0 +1,125 @@
+name: Held-Out Source-Shift Deepfake Image Generalization
+on:
+  push:
+    branches:
+      - research/deepfake-external-20261008
+permissions:
+  contents: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "datasets==3.6.0" "huggingface_hub==0.30.2" "pandas==2.2.3" "pillow==11.2.1" "scikit-image==0.25.2" "scikit-learn==1.6.1" "scipy==1.15.2" "numpy==2.2.5"
+      - name: Train and evaluate on original and independent OOD sources
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_XET: '1'
+        run: |
+          mkdir -p results
+          cat > /tmp/shift.py <<'PY'
+          import os,sys,json,io,hashlib
+          from pathlib import Path
+          from collections import Counter
+          from PIL import Image,ImageFilter
+          import numpy as np,pandas as pd
+          from datasets import load_dataset
+          from huggingface_hub import HfApi
+          from skimage.feature import hog
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.pipeline import Pipeline
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.metrics import accuracy_score,precision_score,recall_score,f1_score,roc_auc_score,average_precision_score,brier_score_loss,log_loss,confusion_matrix
+          O=Path("results");SRC="ThinothW/Deepfake-Identity-Isolated-Dataset-PreP";OOD="wkaandemir/ai-image-detector-dataset"
+          def f(im):
+              im=im.convert("RGB").resize((64,64),Image.Resampling.BILINEAR)
+              a=np.asarray(im,dtype=np.float32)/255.
+              g=np.asarray(im.convert("L"),dtype=np.float32)/255.
+              h=hog(g,orientations=9,pixels_per_cell=(8,8),cells_per_block=(2,2),feature_vector=True).astype(np.float32)
+              c=np.concatenate([a.mean((0,1)),a.std((0,1)),*[np.histogram(a[:,:,k],bins=8,range=(0,1),density=True)[0] for k in range(3)]])
+              return np.concatenate([h,c.astype(np.float32)])
+          def change(im,kind):
+              im=im.convert("RGB")
+              if kind=="jpeg40":
+                  b=io.BytesIO(); im.save(b,format="JPEG",quality=40);b.seek(0);return Image.open(b).convert("RGB")
+              if kind=="blur1.5":return im.filter(ImageFilter.GaussianBlur(1.5))
+              if kind=="down4":return im.resize((max(16,im.width//4),max(16,im.height//4)),Image.Resampling.BILINEAR).resize(im.size,Image.Resampling.BILINEAR)
+              return im
+          def collect(dsname,split,quota,with_corrupt=False,limit=40000):
+              ds=load_dataset(dsname,split=split,streaming=True)
+              ds=ds.shuffle(seed=20261008,buffer_size=1500)
+              features=[];labels=[];hashes=[];ids=[];corrupt={k:[] for k in ("jpeg40","blur1.5","down4")} if with_corrupt else {}
+              counts=Counter()
+              n=0
+              for row in ds:
+                  n+=1
+                  if n>limit:break
+                  label=int(row["label"])
+                  if label not in (0,1) or counts[label]>=quota:continue
+                  im=row["image"]
+                  if not isinstance(im,Image.Image):
+                      im=Image.open(io.BytesIO(im['bytes']) if im.get('bytes') is not None else im['path'])
+                  im=im.convert("RGB")
+                  x=f(im)
+                  if not np.all(np.isfinite(x)):continue
+                  h=hashlib.sha256(im.resize((64,64),Image.Resampling.BILINEAR).tobytes()).hexdigest()
+                  features.append(x);labels.append(1-label);hashes.append(h);ids.append(f"{split}_{n:07d}")
+                  if with_corrupt:
+                      for kind in corrupt:corrupt[kind].append(f(change(im,kind)))
+                  counts[label]+=1
+                  if all(counts[z]>=quota for z in [0,1]):break
+              print('SAMPLE',dsname,split,len(labels),dict(counts),'scanned',n,flush=True)
+              if len(labels)<2*quota:raise RuntimeError(f"insufficient actual samples {dsname} {split}: {dict(counts)}")
+              return dict(X=np.stack(features),y=np.array(labels),sha=hashes,ids=ids, corrupt={k:np.stack(v) for k,v in corrupt.items()})
+          train=collect(SRC,'train',200,limit=40000)
+          val=collect(SRC,'validation',80,limit=25000)
+          test=collect(SRC,'test',80,with_corrupt=True,limit=25000)
+          external=collect(OOD,'external_test',50,limit=1800)
+          hashes={sp:set(d['sha']) for sp,d in [('train',train),('validation',val),('test',test),('external',external)]}
+          for s,h in hashes.items():
+              for t,g in hashes.items():
+                  if s<t and h&g: raise RuntimeError("leakage exact reduced RGB hash "+s+" "+t)
+          manifest=[]
+          for name,d in [('train',train),('validation',val),('test',test),('external',external)]:
+              for i in range(len(d['y'])):
+                  manifest.append(dict(split=name,id=d['ids'][i],label_fake=int(d['y'][i]),sha256_rgb64=d['sha'][i],source_dataset=SRC if name!='external' else OOD))
+          pd.DataFrame(manifest).to_csv(O/'manifest.csv',index=False)
+          dsver=HfApi().dataset_info(SRC).sha;extver=HfApi().dataset_info(OOD).sha
+          config=dict(train_dataset=SRC,train_revision=dsver,external_dataset=OOD,external_revision=extver,source_label_fake=0,positive_label_fake=1,train_classes=Counter(map(int,train['y'])),external_classes=Counter(map(int,external['y'])),source_and_target_different_tasks='External is broad synthetic imagery, not necessarily face swaps; domain and target concept shift.',identity_claim='publisher claims identity-isolation in source; no independently derived face embeddings',models=['logistic','random_forest'],seeds=[11,22,33,44,55],training_set_fixed_across_seeds=True,test_set_fixed_across_seeds=True,val_threshold_selection_only=True,features='HOG/RGB hist; no CNN training')
+          (O/'protocol.json').write_text(json.dumps(config,indent=2))
+          metrics=[]
+          for seed in [11,22,33,44,55]:
+              models=[('logistic',Pipeline([('scaler',StandardScaler()),('lr',LogisticRegression(C=1,max_iter=500,random_state=seed))])),('random_forest',RandomForestClassifier(n_estimators=100,max_depth=20,min_samples_leaf=2,random_state=seed,n_jobs=2))]
+              for name,clf in models:
+                  clf.fit(train['X'],train['y'])
+                  pv=clf.predict_proba(val['X'])[:,1]
+                  tv=max(np.linspace(0.05,0.95,91), key=lambda v:(f1_score(val['y'],(pv>=v).astype(int)), -abs(v-.5)))
+                  for split,d,X in [('test',test,test['X']),('external',external,external['X'])]+[(f'test_{key}',test,xx) for key,xx in test['corrupt'].items()]:
+                      p=clf.predict_proba(X)[:,1];y=d['y'];yh=(p>=tv).astype(int)
+                      tn,fp,fn,tp=map(int,confusion_matrix(y,yh,labels=[0,1]).ravel())
+                      row=dict(seed=seed,model=name,split=split,n=len(y),validation_selected_threshold=float(tv),accuracy=float(accuracy_score(y,yh)),precision_fake=float(precision_score(y,yh,zero_division=0)),recall_fake=float(recall_score(y,yh,zero_division=0)),f1_fake=float(f1_score(y,yh,zero_division=0)),auroc=float(roc_auc_score(y,p)),auprc=float(average_precision_score(y,p)),brier=float(brier_score_loss(y,p)),logloss=float(log_loss(y,p,labels=[0,1])),tn=tn,fp=fp,fn=fn,tp=tp)
+                      metrics.append(row)
+                      pd.DataFrame({'id':d['ids'],'true_fake':y,'p_fake':p,'pred_fake':yh}).to_csv(O/f"pred_{name}_{split}_seed{seed}.csv",index=False)
+                      print("METRIC",json.dumps(row),flush=True)
+          df=pd.DataFrame(metrics);df.to_csv(O/'metrics_all.csv',index=False)
+          df.groupby(['split','model'])[['accuracy','f1_fake','auroc','brier']].agg(['mean','std']).to_csv(O/'summary.csv')
+          (O/'RUN_COMPLETED.json').write_text(json.dumps({'genuine_media':True,'external_source_different':True,'models':2,'seeds':5,'heldout_n':len(test['y']),'external_n':len(external['y']),'total_prediction_csvs':len(metrics),'no_train_test_identical_rgb64_hash':True},indent=2))
+          print('ALL EXPERIMENTS DONE',flush=True)
+          # Prevent a known arrow/Python finalizer crash after all files have been flushed.
+          sys.stdout.flush();sys.stderr.flush();os._exit(0)
+          PY
+          python /tmp/shift.py
+      - name: Upload predictions and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepfake-cross-source-robustness
+          path: results/
+          if-no-files-found: warn
