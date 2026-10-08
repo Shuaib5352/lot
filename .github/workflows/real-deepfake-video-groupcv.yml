@@ -43,6 +43,7 @@ jobs:
               files=list(api.list_repo_tree(repo_id=REPO,repo_type='dataset',path_in_repo='videos/UADFV',recursive=True))
               paths=[v.path for v in files if str(v.path).lower().endswith(('.mp4','.mov'))]
               print('UADFV enumerated path count',len(paths),flush=True)
+              print('UADFV PATH EXAMPLES',paths[:30],flush=True)
           except Exception as exc:
               print('UADFV access failed',str(exc)[:500],flush=True);paths=[]
           bykey=defaultdict(dict)
