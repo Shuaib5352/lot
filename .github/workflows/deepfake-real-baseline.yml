@@ -107,6 +107,9 @@ jobs:
           m[m.split=='test'].groupby('model')[['accuracy','f1_fake','roc_auc','recall_fake']].agg(['mean','std']).to_csv(out/'metrics_test_summary.csv')
           (out/"RUN_COMPLETED.json").write_text(json.dumps({'genuine_media_loaded':True,'dataset':dset,'sha':sha,'count_train':len(ytr),'count_validation':len(yva),'count_test':len(yte),'number_models':2,'number_seeds':5,'rows_metrics':len(m)},indent=2),encoding='utf-8')
           print("GENUINE MEDIA EXPERIMENT COMPLETE",flush=True)
+          # Work around a Hugging Face/libarrow finalizer crash after fully saving all outputs.
+          # This only executes after completion markers and CSVs have been flushed and closed.
+          sys.stdout.flush();sys.stderr.flush();os._exit(0)
           PY
           python /tmp/experiment.py
       - name: Attach real prediction and provenance artifacts
