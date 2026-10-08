@@ -50,7 +50,9 @@ jobs:
           for path in paths:
               lc=path.lower()
               cls= 'real' if '/real/' in lc else 'fake' if '/fake/' in lc else None
-              if cls:bykey[Path(path).stem][cls]=path
+              if cls:
+                  root=Path(path).stem.removesuffix('_fake').removesuffix('_real')
+                  bykey[root][cls]=path
           groups=sorted(k for k,v in bykey.items() if 'real' in v and 'fake' in v)[:24]
           if len(groups)<8:
               raise RuntimeError(f'UADFV has fewer than 8 verified real-fake source file pairs: {len(groups)}. No synthetic replacement allowed.')
