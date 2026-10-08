@@ -81,7 +81,7 @@ jobs:
           train=collect(SRC,'train',200,limit=40000)
           val=collect(SRC,'validation',80,limit=25000)
           test=collect(SRC,'test',80,with_corrupt=True,limit=25000)
-          external=collect(OOD,'external_test',50,limit=1800)
+          external=collect(OOD,'test',50,limit=1800)
           hashes={sp:set(d['sha']) for sp,d in [('train',train),('validation',val),('test',test),('external',external)]}
           for s,h in hashes.items():
               for t,g in hashes.items():
