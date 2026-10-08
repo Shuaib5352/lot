@@ -1,0 +1,122 @@
+name: Arabic-to-English Deepfake Audio External-Shift Benchmark
+on:
+  push:
+    branches:
+      - research/deepfake-audio-external-20261008
+permissions:
+  contents: read
+jobs:
+  audio_cross_source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "datasets==3.6.0" "huggingface_hub==0.30.2" "librosa==0.11.0" "soundfile==0.13.1" "scikit-learn==1.6.1" "numpy==2.2.5" "pandas==2.2.3" "scipy==1.15.2"
+      - name: Run exact held-out Arabic dataset and ASVspoof external evaluation
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_XET: '1'
+        shell: bash
+        run: |
+          mkdir -p results
+          cat >/tmp/audio_external.py <<'PY'
+          import os,sys,io,json,hashlib
+          import librosa,numpy as np,pandas as pd
+          from pathlib import Path
+          from collections import Counter
+          from datasets import load_dataset
+          from huggingface_hub import HfApi
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.pipeline import Pipeline
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.metrics import confusion_matrix,accuracy_score,precision_score,recall_score,f1_score,roc_auc_score,average_precision_score,brier_score_loss,log_loss
+          O=Path('results')
+          A='DeepFake-Audio-Rangers/Arabic_Audio_Deepfake'
+          B='SpeechAntiSpoofingBenchmarks/ASVspoof2019_LA'
+          def feat(a,sr):
+              a=np.asarray(a,dtype=np.float32)
+              if sr !=16000:a=librosa.resample(a,orig_sr=sr,target_sr=16000);sr=16000
+              if len(a)<512:raise ValueError('short')
+              # deterministic up to first 3 seconds, matching internal Arabic sample length
+              a=a[:48000]
+              mf=librosa.feature.mfcc(y=a,sr=sr,n_mfcc=20,n_fft=512,hop_length=160)
+              dd=librosa.feature.delta(mf,mode='nearest')
+              rms=librosa.feature.rms(y=a,frame_length=512,hop_length=160)[0]
+              zcr=librosa.feature.zero_crossing_rate(a,frame_length=512,hop_length=160)[0]
+              cen=librosa.feature.spectral_centroid(y=a,sr=sr,n_fft=512,hop_length=160)[0]
+              return np.concatenate([mf.mean(axis=1),mf.std(axis=1),dd.mean(axis=1),dd.std(axis=1),np.array([rms.mean(),rms.std(),zcr.mean(),zcr.std(),cen.mean(),cen.std(),np.log1p(len(a)/sr)],dtype=np.float32)]).astype(np.float32)
+          def get(name,split,quota,external=False):
+              ds=load_dataset(name,split=split,streaming=True).shuffle(seed=20261008,buffer_size=1000)
+              x=[];y=[];hashes=[];ident=[];speakers=[];scanned=0;count=Counter()
+              for item in ds:
+                  scanned+=1
+                  cls=int(item['label'])
+                  if cls not in [0,1] or count[cls]>=quota:continue
+                  au=item['audio']
+                  a=au['array'];sr=int(au['sampling_rate'])
+                  try: ff=feat(a,sr)
+                  except Exception:continue
+                  if not np.isfinite(ff).all():continue
+                  speaker=None
+                  if external:
+                      try:speaker=json.loads(item.get('notes') or '{}').get('speaker_id')
+                      except:pass
+                  x.append(ff); y.append(cls if external else 1-cls)
+                  hashes.append(hashlib.sha256(np.asarray(a,dtype='<f4').tobytes()).hexdigest())
+                  ident.append(item.get('path',f'{split}-{scanned}') if external else f'{split}-{scanned}')
+                  speakers.append(speaker)
+                  count[cls]+=1
+                  if all(count[i]>=quota for i in [0,1]):break
+                  if scanned>50000:break
+              print('GET',name,split,'classes',dict(count),'scanned',scanned,flush=True)
+              if len(y)<2*quota:raise RuntimeError('Could not obtain real class-balanced audio from '+name)
+              return dict(X=np.stack(x),y=np.array(y),sha=hashes,id=ident,speakers=speakers,scanned=scanned)
+          ar_train=get(A,'train',190)
+          ar_test=get(A,'test',70)
+          ext=get(B,'test',40,external=True)
+          inds=np.array([i for cls in [0,1] for i in np.where(ar_train['y']==cls)[0][:145]])
+          vali=np.array([i for cls in [0,1] for i in np.where(ar_train['y']==cls)[0][145:]])
+          train={k:np.asarray(v)[inds] for k,v in ar_train.items() if k not in ('scanned','X')}
+          val={k:np.asarray(v)[vali] for k,v in ar_train.items() if k not in ('scanned','X')}
+          xtrain=ar_train['X'][inds]; xval=ar_train['X'][vali]
+          if set(train['sha'])&set(val['sha']) or set(train['sha'])&set(ar_test['sha']) or set(train['sha'])&set(ext['sha']) or set(val['sha'])&set(ar_test['sha']):
+              raise RuntimeError('Train/validation/test raw audio sample overlap')
+          manifest=[]
+          for split,d in [('train',train),('validation',val),('test',ar_test),('external_asvspoof',ext)]:
+              for j in range(len(d['y'])):manifest.append(dict(split=split,id=str(d['id'][j]),sha256=str(d['sha'][j]),label_fake=int(d['y'][j]),speaker_id=d['speakers'][j]))
+          pd.DataFrame(manifest).to_csv(O/'sample_manifest.csv',index=False)
+          metadata=dict(train_dataset=A,train_revision=HfApi().dataset_info(A).sha,external_dataset=B,external_revision=HfApi().dataset_info(B).sha,source_label_mapping={'0':'fake','1':'real'},external_label_mapping={'0':'bonafide','1':'spoof'},positive_label_fake=1,external_speakers=sorted(set(str(i) for i in ext['speakers'] if i is not None)),source_speaker_disjoint=False,source_speaker_information='unavailable',models=['logistic','random_forest'],seeds=[11,22,33,44,55],all_model_seeds_share_same_train_val_test_samples=True,features='87-dimensional MFCC/spectral statistics; no neural representation or end-to-end Res2Net',external_distribution='Different language, speakers, corpus, spoofing synthesis and duration; benchmark external source generalization only')
+          (O/'protocol.json').write_text(json.dumps(metadata,indent=2))
+          rows=[]
+          for seed in [11,22,33,44,55]:
+              models=[('logistic',Pipeline([('scale',StandardScaler()),('lr',LogisticRegression(max_iter=500,random_state=seed))])),('random_forest',RandomForestClassifier(n_estimators=100,max_depth=20,min_samples_leaf=2,n_jobs=2,random_state=seed))]
+              for name,model in models:
+                  model.fit(xtrain,train['y'])
+                  pv=model.predict_proba(xval)[:,1]
+                  tt=max(np.linspace(.05,.95,91),key=lambda th:(f1_score(val['y'],(pv>=th).astype(int)),-abs(th-.5)))
+                  for split,d,X in [('test',ar_test,ar_test['X']),('external_asvspoof',ext,ext['X'])]:
+                      p=model.predict_proba(X)[:,1];y=d['y'];yh=(p>=tt).astype(int)
+                      tn,fp,fn,tp=map(int,confusion_matrix(y,yh,labels=[0,1]).ravel())
+                      row=dict(model=name,seed=seed,split=split,n=len(y),threshold=float(tt),accuracy=float(accuracy_score(y,yh)),precision=float(precision_score(y,yh,zero_division=0)),recall=float(recall_score(y,yh,zero_division=0)),f1=float(f1_score(y,yh,zero_division=0)),auroc=float(roc_auc_score(y,p)),auprc=float(average_precision_score(y,p)),brier=float(brier_score_loss(y,p)),log_loss=float(log_loss(y,p,labels=[0,1])),tn=tn,fp=fp,fn=fn,tp=tp)
+                      rows.append(row)
+                      pd.DataFrame(dict(id=d['id'],label_fake=y,p_fake=p,pred_fake=yh,speaker_id=d['speakers'])).to_csv(O/f'pred_{name}_{split}_seed{seed}.csv',index=False)
+                      print('RESULT',json.dumps(row),flush=True)
+          df=pd.DataFrame(rows);df.to_csv(O/'metrics_all.csv',index=False)
+          df.groupby(['model','split'])[['accuracy','auroc','f1']].agg(['mean','std']).to_csv(O/'summary.csv')
+          (O/'RUN_COMPLETED.json').write_text(json.dumps(dict(genuine_source_audio=True,external_corpus_audio=True,external_n=len(ext['y']),audio_test_n=len(ar_test['y']),n_prediction_runs=len(rows)),indent=2))
+          print('EXTERNAL AUDIO TEST COMPLETE',flush=True);sys.stdout.flush();sys.stderr.flush();os._exit(0)
+          PY
+          python /tmp/audio_external.py
+      - name: Upload genuine-media artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepfake-audio-cross-source
+          path: results/
+          if-no-files-found: warn
