@@ -1,0 +1,107 @@
+name: Real Arabic Deepfake Audio Baseline — isolated experiment
+on:
+  push:
+    branches:
+      - research/deepfake-audio-20261008
+permissions:
+  contents: read
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "datasets==3.6.0" "librosa==0.11.0" "soundfile==0.13.1" "scikit-learn==1.6.1" "numpy==2.2.5" "pandas==2.2.3" "scipy==1.15.2" "huggingface_hub==0.30.2"
+      - name: Genuine-media voice-conversion evaluation
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_XET: '1'
+        run: |
+          mkdir -p results
+          cat >/tmp/audio.py <<'PY'
+          import os, json, sys, hashlib
+          from pathlib import Path
+          from collections import Counter
+          import numpy as np
+          import pandas as pd
+          import librosa
+          from datasets import load_dataset
+          from huggingface_hub import HfApi
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.pipeline import Pipeline
+          from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score, brier_score_loss, log_loss
+          out=Path("results");dataset="DeepFake-Audio-Rangers/Arabic_Audio_Deepfake"
+          def feat(a,sr):
+              if len(a)<128 or sr<4000:raise ValueError("audio too short")
+              if sr !=16000:a=librosa.resample(a.astype(np.float32),orig_sr=sr,target_sr=16000);sr=16000
+              mfcc=librosa.feature.mfcc(y=a,sr=sr,n_mfcc=20,n_fft=512,hop_length=160)
+              d=librosa.feature.delta(mfcc,mode="nearest")
+              rms=librosa.feature.rms(y=a,frame_length=512,hop_length=160)[0]
+              zcr=librosa.feature.zero_crossing_rate(a,frame_length=512,hop_length=160)[0]
+              cen=librosa.feature.spectral_centroid(y=a,sr=sr,n_fft=512,hop_length=160)[0]
+              return np.concatenate([mfcc.mean(axis=1),mfcc.std(axis=1),d.mean(axis=1),d.std(axis=1),np.array([rms.mean(),rms.std(),zcr.mean(),zcr.std(),cen.mean(),cen.std(),np.log1p(len(a)/sr)],dtype=np.float32)]).astype(np.float32)
+          def take(split,per_class):
+              ds=load_dataset(dataset,split=split,streaming=True).shuffle(seed=20261008,buffer_size=3000)
+              xs=[];ys=[];hs=[];ids=[];ct=Counter()
+              for idx,row in enumerate(ds):
+                  source_label=int(row["label"])
+                  if source_label not in (0,1) or ct[source_label]>=per_class:continue
+                  aud=row["audio"]
+                  a=np.asarray(aud["array"],dtype=np.float32); sr=int(aud["sampling_rate"])
+                  f=feat(a,sr)
+                  if not np.all(np.isfinite(f)):continue
+                  h=hashlib.sha256(a.astype('<f4').tobytes()).hexdigest()
+                  xs.append(f);ys.append(1-source_label);hs.append(h);ids.append(f"{split}-{idx}")
+                  ct[source_label]+=1
+                  if min(ct[0],ct[1])>=per_class:break
+                  if idx>=20000:break
+              print("COLLECT",split,"rows",len(ys),"classes",dict(ct),flush=True)
+              if len(ys)!=2*per_class:raise RuntimeError("insufficient verified audio samples")
+              return np.stack(xs),np.array(ys),np.array(hs),np.array(ids)
+          X,Y,H,IDs=take("train",210)
+          xte,yte,hte,idte=take("test",80)
+          if set(H)&set(hte):raise RuntimeError("Audio overlap between train and test")
+          # validation drawn from training split, disjoint instances; speaker metadata unavailable
+          tr=np.array([i for lbl in [0,1] for i in np.where(Y==lbl)[0][:150]])
+          va=np.array([i for lbl in [0,1] for i in np.where(Y==lbl)[0][150:]])
+          xtr,ytr,htr,idtr=X[tr],Y[tr],H[tr],IDs[tr]
+          xva,yva,hva,idva=X[va],Y[va],H[va],IDs[va]
+          if (set(htr)&set(hva)) or (set(hva)&set(hte)):raise RuntimeError("Audio near exact sample overlap")
+          df=pd.DataFrame([{"split":split,"id":str(ids[i]),"sha256":str(hs[i]),"label_fake":int(y[i])} for split,ids,hs,y in [('train',idtr,htr,ytr),('validation',idva,hva,yva),('test',idte,hte,yte)] for i in range(len(y))])
+          df.to_csv(out/'manifest.csv',index=False)
+          sha=HfApi().dataset_info(dataset).sha
+          meta={"dataset":dataset,"revision":sha,"label_definition":"fake=1,real=0","source_class_label_0":"fake","features":"MFCC/delta/log spectral moments, not pretrained Res2Net","speaker_disjoint_verified":False,"speaker_disjoint_warning":"No speaker IDs in source table; train/test could share speakers.","model_seeds":[11,22,33,44,55],"samples":{"train":len(ytr),"validation":len(yva),"test":len(yte)}}
+          (out/'protocol.json').write_text(json.dumps(meta,indent=2))
+          results=[]
+          for seed in [11,22,33,44,55]:
+              for name,clf in [('logistic',Pipeline([('standard',StandardScaler()),('model',LogisticRegression(max_iter=500,random_state=seed))])),('random_forest',RandomForestClassifier(n_estimators=100,max_depth=20,min_samples_leaf=2,random_state=seed,n_jobs=2))]:
+                  clf.fit(xtr,ytr)
+                  pv=clf.predict_proba(xva)[:,1]
+                  thresholds=np.linspace(0.05,0.95,91)
+                  t=max(thresholds,key=lambda a:(f1_score(yva,(pv>=a).astype(int)), -abs(a-.5)))
+                  for split,x,y,ids in [('validation',xva,yva,idva),('test',xte,yte,idte)]:
+                      p=clf.predict_proba(x)[:,1];yhat=(p>=t).astype(int)
+                      tn,fp,fn,tp=confusion_matrix(y,yhat,labels=[0,1]).ravel()
+                      m={"seed":seed,"model":name,"split":split,"n":len(y),"threshold":float(t),"accuracy":accuracy_score(y,yhat),"balanced_accuracy":balanced_accuracy_score(y,yhat),"precision_fake":precision_score(y,yhat,zero_division=0),"recall_fake":recall_score(y,yhat,zero_division=0),"f1_fake":f1_score(y,yhat,zero_division=0),"roc_auc":roc_auc_score(y,p),"pr_auc":average_precision_score(y,p),"brier":brier_score_loss(y,p),"log_loss":log_loss(y,p),"tn":int(tn),"fp":int(fp),"fn":int(fn),"tp":int(tp)}
+                      results.append(m);print("METRIC",json.dumps(m),flush=True)
+                      pd.DataFrame({"id":ids,"true_fake":y,"p_fake":p,"pred_fake":yhat,"seed":seed,"model":name,"split":split}).to_csv(out/f"pred_{name}_seed{seed}_{split}.csv",index=False)
+          pd.DataFrame(results).to_csv(out/'metrics.csv',index=False)
+          (out/'RUN_COMPLETED.json').write_text(json.dumps({"real_audio_loaded":True,"dataset":dataset,"sha":sha,"n_train":len(ytr),"n_validation":len(yva),"n_test":len(yte),"seeds":5,"models":2},indent=2))
+          print("REAL ARABIC AUDIO EXPERIMENT COMPLETE")
+          PY
+          python /tmp/audio.py
+      - name: Attach provenance and predictions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genuine-deepfake-audio-evidence
+          path: results/
+          if-no-files-found: warn
