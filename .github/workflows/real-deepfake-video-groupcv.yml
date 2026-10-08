@@ -49,7 +49,7 @@ jobs:
           bykey=defaultdict(dict)
           for path in paths:
               lc=path.lower()
-              cls= 'real' if '/video/' in lc else 'fake' if '/deepfake/' in lc else None
+              cls= 'real' if lc.startswith('video/') else 'fake' if lc.startswith('deepfake/') else None
               if cls:
                   root=Path(path).stem.removesuffix('_fake').removesuffix('_real')
                   bykey[root][cls]=path
