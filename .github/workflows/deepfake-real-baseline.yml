@@ -1,0 +1,118 @@
+name: Real Deepfake Face Baseline — isolated experiment
+on:
+  push:
+    branches:
+      - research/deepfake-evidence-20261008
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned scientific environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "datasets==3.6.0" "scikit-learn==1.6.1" "scikit-image==0.25.2" "pillow==11.2.1" "numpy==2.2.5" "pandas==2.2.3" "scipy==1.15.2" "huggingface_hub==0.30.2"
+      - name: Run genuine-media baseline (NO fabricated results)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_XET: '1'
+          HF_HUB_ENABLE_HF_TRANSFER: '0'
+        shell: bash
+        run: |
+          mkdir -p results
+          cat > /tmp/experiment.py <<'PY'
+          import os, json, sys, time, random, hashlib, platform
+          from collections import Counter
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from PIL import Image
+          import scipy
+          from scipy.special import expit
+          from datasets import load_dataset
+          from huggingface_hub import HfApi
+          from skimage.feature import hog
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, average_precision_score, confusion_matrix, precision_score, recall_score, log_loss, brier_score_loss)
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.pipeline import Pipeline
+          dset = "ThinothW/Deepfake-Identity-Isolated-Dataset-PreP"
+          out=Path("results")
+          def feat(im):
+              im=im.convert("RGB").resize((64,64),Image.Resampling.BILINEAR)
+              a=np.asarray(im,dtype=np.float32)/255
+              gray=np.asarray(im.convert("L"),dtype=np.float32)/255
+              vec=hog(gray,orientations=9,pixels_per_cell=(8,8),cells_per_block=(2,2),feature_vector=True).astype(np.float32)
+              color=np.concatenate([a.mean(axis=(0,1)),a.std(axis=(0,1)),* [np.histogram(a[:,:,k],bins=8,range=(0,1),density=True)[0] for k in range(3)]])
+              return np.concatenate([vec,color.astype(np.float32)])
+          def collect(split,per_class):
+              ds=load_dataset(dset,split=split,streaming=True)
+              ds=ds.shuffle(seed=20261008, buffer_size=3000)
+              f=[]; labels=[]; shas=[]; rowids=[]
+              counts=Counter(); scanned=0
+              for item in ds:
+                  scanned+=1
+                  label=int(item["label"])
+                  if label not in [0,1]: continue
+                  if counts[label]>=per_class: continue
+                  im=item["image"]
+                  if not isinstance(im,Image.Image): im=Image.open(im["path"] if "path" in im else im["bytes"])
+                  b=im.convert("RGB").tobytes()
+                  digest=hashlib.sha256(b).hexdigest()
+                  f.append(feat(im)); labels.append(1-label); shas.append(digest); rowids.append(f"{split}-{scanned:07d}")
+                  counts[label]+=1
+                  if all(counts[x]>=per_class for x in [0,1]): break
+                  if scanned>=30000: break
+              print("COLLECT",split,"counts",dict(counts),"scanned",scanned,flush=True)
+              if len(labels)!=2*per_class: raise RuntimeError("insufficient balanced genuine samples for "+split)
+              return np.stack(f),np.array(labels),np.array(shas),np.array(rowids),scanned
+          (xtr,ytr,htr,idtr,ntr)=collect("train",250)
+          (xva,yva,hva,idva,nva)=collect("validation",100)
+          (xte,yte,hte,idte,nte)=collect("test",100)
+          if (set(htr)&set(hva)) or (set(htr)&set(hte)) or (set(hva)&set(hte)):
+              raise RuntimeError("Cross split exact image hash leakage detected")
+          manifest=[]
+          for s,y,h,ids in [('train',ytr,htr,idtr),('validation',yva,hva,idva),('test',yte,hte,idte)]:
+              manifest.extend([{'split':s,'id':str(ids[i]),'label_fake':int(y[i]),'sha256':str(h[i])} for i in range(len(y))])
+          pd.DataFrame(manifest).to_csv(out/"sample_manifest.csv",index=False)
+          sha=HfApi().dataset_info(dset).sha
+          cfg={'dataset':dset,'revision':sha,'source_label_0':'fake','source_label_1':'real','our_positive_label_1':'fake','samples':{'train':len(ytr),'validation':len(yva),'test':len(yte)},'sampling':'shuffle(buffer_size=3000,seed=20261008) within published identity-disjoint splits; class-balanced quotas','features':'HOG and RGB histogram statistics, not CNN re-training','seeds':[11,22,33,44,55],'scanned':{'train':ntr,'validation':nva,'test':nte},'environment':{'python':sys.version,'numpy':np.__version__,'scipy':scipy.__version__},'publisher_identity_isolation':'asserted by publisher, not independently face-embedding audited'}
+          (out/"config.json").write_text(json.dumps(cfg,indent=2),encoding="utf-8")
+          allmetrics=[]
+          for seed in [11,22,33,44,55]:
+              for name,clf in [('logistic',Pipeline([('scaler',StandardScaler()),('model',LogisticRegression(max_iter=500,C=1.0,random_state=seed))])),('random_forest',RandomForestClassifier(n_estimators=100,max_depth=20,min_samples_leaf=2,random_state=seed,n_jobs=2))]:
+                  clf.fit(xtr,ytr)
+                  v=clf.predict_proba(xva)[:,1]
+                  # threshold chosen ONLY using validation F1
+                  thresholds=np.linspace(0.05,0.95,91)
+                  tv=max(thresholds,key=lambda z:(f1_score(yva,(v>=z).astype(int)), -abs(z-.5)))
+                  for split,x,y,ids in [('validation',xva,yva,idva),('test',xte,yte,idte)]:
+                      p=clf.predict_proba(x)[:,1]
+                      yh=(p>=tv).astype(int)
+                      tn,fp,fn,tp=confusion_matrix(y,yh,labels=[0,1]).ravel()
+                      metric={'model':name,'seed':seed,'split':split,'n':len(y),'positive_label':'fake','threshold_validation_selected':float(tv),'accuracy':accuracy_score(y,yh),'balanced_accuracy':balanced_accuracy_score(y,yh),'precision_fake':precision_score(y,yh,zero_division=0),'recall_fake':recall_score(y,yh,zero_division=0),'f1_fake':f1_score(y,yh,zero_division=0),'roc_auc':roc_auc_score(y,p),'average_precision_fake':average_precision_score(y,p),'brier':brier_score_loss(y,p),'log_loss':log_loss(y,p,labels=[0,1]),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp)}
+                      allmetrics.append(metric)
+                      pd.DataFrame({'id':ids,'y_true_fake':y,'p_fake':p,'pred_fake':yh,'model':name,'seed':seed,'split':split}).to_csv(out/f"pred_{name}_seed{seed}_{split}.csv",index=False)
+                      print("METRIC", json.dumps(metric),flush=True)
+          pd.DataFrame(allmetrics).to_csv(out/"metrics_all.csv",index=False)
+          m=pd.DataFrame(allmetrics)
+          m[m.split=='test'].groupby('model')[['accuracy','f1_fake','roc_auc','recall_fake']].agg(['mean','std']).to_csv(out/'metrics_test_summary.csv')
+          (out/"RUN_COMPLETED.json").write_text(json.dumps({'genuine_media_loaded':True,'dataset':dset,'sha':sha,'count_train':len(ytr),'count_validation':len(yva),'count_test':len(yte),'number_models':2,'number_seeds':5,'rows_metrics':len(m)},indent=2),encoding='utf-8')
+          print("GENUINE MEDIA EXPERIMENT COMPLETE",flush=True)
+          PY
+          python /tmp/experiment.py
+      - name: Attach real prediction and provenance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepfake-real-media-evidence
+          path: results/
+          if-no-files-found: warn
