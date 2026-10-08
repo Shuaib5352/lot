@@ -1,4 +1,4 @@
-name: Real Paired Deepfake Video Group-Holdout Pilot
+name: Small Genuine Video Pair Cross-Validation (Feasibility Only)
 on:
   push:
     branches:
@@ -37,26 +37,26 @@ jobs:
           from sklearn.ensemble import RandomForestClassifier
           from sklearn.pipeline import Pipeline
           from sklearn.preprocessing import StandardScaler
-          REPO='belkhir-nacim/deepfake-videos';OUT=Path('results')
+          REPO='ud-biometrics/deepfake-dataset';OUT=Path('results')
           api=HfApi()
           try:
-              files=list(api.list_repo_tree(repo_id=REPO,repo_type='dataset',path_in_repo='videos/UADFV',recursive=True))
+              files=list(api.list_repo_tree(repo_id=REPO,repo_type='dataset',recursive=True))
               paths=[v.path for v in files if str(v.path).lower().endswith(('.mp4','.mov'))]
-              print('UADFV enumerated path count',len(paths),flush=True)
-              print('UADFV PATH EXAMPLES',paths[:30],flush=True)
+              print('public video dataset enumerated path count',len(paths),flush=True)
+              print('PUBLIC VIDEO PATH EXAMPLES',paths[:30],flush=True)
           except Exception as exc:
               print('UADFV access failed',str(exc)[:500],flush=True);paths=[]
           bykey=defaultdict(dict)
           for path in paths:
               lc=path.lower()
-              cls= 'real' if '/real/' in lc else 'fake' if '/fake/' in lc else None
+              cls= 'real' if '/video/' in lc else 'fake' if '/deepfake/' in lc else None
               if cls:
                   root=Path(path).stem.removesuffix('_fake').removesuffix('_real')
                   bykey[root][cls]=path
-          groups=sorted(k for k,v in bykey.items() if 'real' in v and 'fake' in v)[:24]
-          if len(groups)<8:
-              raise RuntimeError(f'UADFV has fewer than 8 verified real-fake source file pairs: {len(groups)}. No synthetic replacement allowed.')
-          print('UADFV paired sources',len(groups),flush=True)
+          groups=sorted(k for k,v in bykey.items() if 'real' in v and 'fake' in v)[:5]
+          if len(groups)<5:
+              raise RuntimeError(f'Small video dataset has fewer than 5 verifiable case pairs: {len(groups)}. No synthetic replacement allowed.')
+          print('Video case pairs',len(groups),flush=True)
           def encode(path):
               fn=hf_hub_download(repo_id=REPO,repo_type='dataset',filename=path)
               rawsha=hashlib.sha256(Path(fn).read_bytes()).hexdigest()
@@ -93,11 +93,11 @@ jobs:
                   features.append(feat);labels.append(int(cls=='fake'));pairs.append(k)
                   manifest.append({'group_pair_key':k,'path':fn,'label_fake':int(cls=='fake'),'sha256_video':sha,'frames_decoded':nframes,'total_frames_reported':total})
               print('PAIRED',k,flush=True)
-          if len(set(pairs))<8:raise RuntimeError('Insufficient complete authentic pairs after decoding')
+          if len(set(pairs))<5:raise RuntimeError('Insufficient complete authentic pairs after decoding')
           X=np.stack(features);y=np.array(labels);gg=np.array(pairs)
           pd.DataFrame(manifest).to_csv(OUT/'manifest.csv',index=False)
           if len(set(v['sha256_video'] for v in manifest))!=len(manifest):raise RuntimeError('Exact duplicate videos between pair groups')
-          folds=GroupKFold(n_splits=4)
+          folds=GroupKFold(n_splits=5)
           rows=[]; preds=[]
           for seed in [11,22,33,44,55]:
               for fold,(tr,te) in enumerate(folds.split(X,y,gg),1):
@@ -112,7 +112,7 @@ jobs:
                       rows.append(d);print('RESULT',json.dumps(d),flush=True)
           pd.DataFrame(preds).to_csv(OUT/'video_group_cv_predictions.csv',index=False)
           pd.DataFrame(rows).to_csv(OUT/'video_group_cv_fold_metrics.csv',index=False)
-          meta=dict(dataset=REPO,repo_revision=api.dataset_info(REPO).sha,used_source='UADFV',actual_real_fake_pairs=len(set(pairs)),actual_video_count=len(manifest),grouping='real/fake matching basename pair held together across folds; subject identity isolation NOT independently verified',source_label='fake positive',features='HOG + color and temporal summary of 8 decoded frames, NOT a trained deep video neural network',seeds=[11,22,33,44,55],folds=4,limitations='Small UADFV pilot; publication should NOT claim robust video generalization across identities or datasets')
+          meta=dict(dataset=REPO,repo_revision=api.dataset_info(REPO).sha,used_source='ud-biometrics 5 source cases',actual_real_fake_pairs=len(set(pairs)),actual_video_count=len(manifest),grouping='real/fake matching basename pair held together across folds; subject identity isolation NOT independently verified',source_label='fake positive',features='HOG + color and temporal summary of 8 decoded frames, NOT a trained deep video neural network',seeds=[11,22,33,44,55],folds=4,limitations='Only 5 real/fake case pairs, non-commercial dataset license; strictly technical feasibility, not scientifically powered video generalization')
           (OUT/'protocol.json').write_text(json.dumps(meta,indent=2))
           (OUT/'RUN_COMPLETED.json').write_text(json.dumps({'genuine_video_loaded':True,'videos':len(manifest),'verified_pairs':len(set(pairs)),'fold_metrics':len(rows),'predictions':len(preds)},indent=2))
           print('VIDEO GROUP-HOLDOUT COMPLETE',flush=True);sys.stdout.flush();sys.stderr.flush();os._exit(0)
